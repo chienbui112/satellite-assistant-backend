@@ -1,0 +1,31 @@
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# --- LLM / Orchestration ---
+# Compatible ranges (not exact pins) so the ecosystem can resolve cleanly;
+# every package in this stack moves in lockstep with langchain-core.
+langchain>=0.3.14,<0.4
+langchain-core>=0.3.30,<0.4
+langgraph>=0.2.62,<0.3
+
+# --- LLM providers ---
+# Keep what you use. langchain-ollama is the only one with a "free" runtime
+# (you still need the Ollama daemon); the others need an API key in .env.
+langchain-ollama>=0.2.2,<0.4
+langchain-anthropic>=0.3.3,<0.4
+langchain-openai>=0.3.0,<0.4
+langchain-google-genai>=2.0.8,<3
+langchain-groq>=0.2.0,<0.4
+
+# --- Geospatial / STAC ---
+pystac-client==0.8.5
+shapely==2.0.6
+geojson-pydantic==1.2.0
+
+# --- HTTP / Utilities ---
+httpx==0.28.1
+tenacity==9.0.0
