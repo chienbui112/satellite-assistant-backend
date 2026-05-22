@@ -76,8 +76,15 @@ class STACService:
         page: int,
         limit: int,
         sort_by: SortOrder,
+        geometry: Optional[dict] = None,
     ) -> Tuple[List[Scene], int]:
         """Fetch one page from STAC + the total-matched count.
+
+        Spatial filter rules:
+          - `geometry` (Polygon / MultiPolygon, EPSG:4326): preferred when
+            present — sent as `intersects` per the STAC spec. More precise
+            than the bbox envelope for non-rectangular admin areas.
+          - `bbox`: used as a fallback when no polygon is available.
 
         pystac-client doesn't expose direct offset paging; we fetch up to
         page*limit items (the client follows `next` rel links transparently)
@@ -90,15 +97,21 @@ class STACService:
             query["eo:cloud_cover"] = {"lt": max_cloud_cover}
 
         max_items = page * limit
-        search = client.search(
-            collections=[self._settings.stac_collection],
-            bbox=list(bbox),
-            datetime=datetime_range,
-            query=query or None,
-            limit=limit,
-            max_items=max_items,
-            sortby=_SORT_FIELDS[sort_by],
-        )
+        search_kwargs = {
+            "collections": [self._settings.stac_collection],
+            "datetime": datetime_range,
+            "query": query or None,
+            "limit": limit,
+            "max_items": max_items,
+            "sortby": _SORT_FIELDS[sort_by],
+        }
+        if geometry:
+            # `intersects` and `bbox` are mutually exclusive in STAC; honour
+            # the polygon and skip the envelope.
+            search_kwargs["intersects"] = geometry
+        else:
+            search_kwargs["bbox"] = list(bbox)
+        search = client.search(**search_kwargs)
 
         # `matched()` returns the total from the STAC `context` extension —
         # Earth Search v1 includes it. Returns None if the server doesn't,
@@ -177,8 +190,14 @@ class STACService:
         limit: Optional[int] = None,
         page: int = 1,
         sort_by: SortOrder = SortOrder.NEWEST,
+        geometry: Optional[dict] = None,
     ) -> Tuple[List[Scene], int]:
-        """Returns (scenes_for_this_page, total_matched)."""
+        """Returns (scenes_for_this_page, total_matched).
+
+        If `geometry` is provided, it's used as the STAC `intersects` filter
+        (more precise than the bbox envelope). `bbox` is still required as
+        a fallback for the polygon's bounding box.
+        """
         if page < 1:
             page = 1
         limit = min(
@@ -191,6 +210,7 @@ class STACService:
             return await asyncio.to_thread(
                 self._search_sync,
                 bbox, datetime_range, max_cloud_cover, page, limit, sort_by,
+                geometry,
             )
         except APIError as e:
             logger.exception("STAC API error")

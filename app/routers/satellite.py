@@ -17,7 +17,8 @@ LLM-context discipline: no GeoJSON ever passes through the LLM context.
 This endpoint is direct frontend ↔ backend, no LLM involvement.
 """
 
-from typing import Optional
+import json
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
@@ -45,6 +46,41 @@ router = APIRouter(prefix="/api", tags=["satellite"])
 
 # Defensive cap on STAC pagination depth (see stac_service notes).
 MAX_PAGE = 100
+
+
+def _parse_geometry(geometry: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Decode a URL-encoded GeoJSON Polygon/MultiPolygon from the query string.
+
+    GET requests can't carry a body, so the frontend sends the geometry via
+    a `geometry=<encodeURIComponent(JSON.stringify(g))>` query param. We
+    validate shape strictly here so providers downstream can trust it.
+    """
+    if not geometry:
+        return None
+    try:
+        decoded = json.loads(geometry)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="geometry must be a URL-encoded JSON Polygon/MultiPolygon",
+        )
+    if not isinstance(decoded, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="geometry must be a GeoJSON object",
+        )
+    gtype = decoded.get("type")
+    if gtype not in ("Polygon", "MultiPolygon"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"geometry.type must be Polygon or MultiPolygon, got {gtype!r}",
+        )
+    if not isinstance(decoded.get("coordinates"), list):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="geometry.coordinates missing or not a list",
+        )
+    return decoded
 
 
 def _parse_bbox(bbox: str) -> BBox:
@@ -78,12 +114,25 @@ async def search_satellite(
     bbox: str = Query(
         ..., description="Comma-separated: min_lon,min_lat,max_lon,max_lat",
     ),
+    geometry: Optional[str] = Query(
+        None,
+        description=(
+            "Optional URL-encoded GeoJSON Polygon/MultiPolygon. "
+            "When present, overrides bbox as the spatial filter."
+        ),
+    ),
     date_start: Optional[str] = Query(None, description="ISO-8601 date YYYY-MM-DD"),
     date_end: Optional[str] = Query(None, description="ISO-8601 date YYYY-MM-DD"),
     max_cloud: Optional[float] = Query(None, ge=0, le=100),
     sort_by: SortOrder = Query(
         SortOrder.NEWEST,
         description="'newest' (datetime desc) or 'lowest_cloud' (cloud asc)",
+    ),
+    image_type: Optional[str] = Query(
+        "optical", description="optical | thermal | sar",
+    ),
+    gsd: Optional[str] = Query(
+        "Very-high", description="Very-high | High | Medium | Low",
     ),
     page: int = Query(1, ge=1, le=MAX_PAGE),
     # Spec: default 10 across all providers (Sentinel changes 5→10 too).
@@ -92,6 +141,7 @@ async def search_satellite(
     external: ExternalProviderService = Depends(get_external_provider_service),
 ) -> SearchResultsPayload:
     bbox_tuple = _parse_bbox(bbox)
+    geometry_obj = _parse_geometry(geometry)
 
     if provider == Provider.SENTINEL:
         try:
@@ -103,6 +153,7 @@ async def search_satellite(
                 limit=limit,
                 page=page,
                 sort_by=sort_by,
+                geometry=geometry_obj,
             )
         except STACSearchError as e:
             raise HTTPException(
@@ -113,6 +164,11 @@ async def search_satellite(
         # The aggregator's `cloud_cover` is a [min, max] range; we map the
         # caller's single `max_cloud` to the upper bound, with 0 as floor.
         cloud_range = (0.0, float(max_cloud) if max_cloud is not None else 100.0)
+        # AxelGlobe doesn't accept GSD filtering — strip it for that provider
+        # so the request body matches what their API expects. The frontend
+        # also disables the dropdown when this tab is active, but this is
+        # the defensive backend half of that contract.
+        effective_gsd = gsd if provider != Provider.AXELGLOBE else None
         try:
             scenes, matched = await external.search(
                 provider=provider,
@@ -122,6 +178,9 @@ async def search_satellite(
                 cloud_range=cloud_range,
                 page=page,
                 limit=limit,
+                image_type=image_type or "optical",
+                gsd=effective_gsd,
+                geometry=geometry_obj,
             )
         except ExternalProviderError as e:
             raise HTTPException(
@@ -148,5 +207,7 @@ async def search_satellite(
             date_end=date_end,
             max_cloud=max_cloud,
             sort_by=sort_by,
+            image_type=image_type,
+            gsd=gsd if provider != Provider.AXELGLOBE else None,
         ),
     )

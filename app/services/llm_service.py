@@ -115,15 +115,24 @@ class LLMService:
     def _build_tools(self):
         @tool("geocode_location", args_schema=GeocodeArgs)
         def geocode_location(location_name):
-            """Resolve a place name into a bounding box + center point.
+            """Resolve a place name into a bbox + center + administrative
+            polygon (when available).
 
             Call this FIRST when the user mentions a city/region/country by
             name (e.g. "Hanoi", "Hà Nội", "Tokyo", "Da Nang") and you do not
             already have a bbox for it from the map context. Returns:
-              {name, center: [lat, lon], bbox: [min_lon, min_lat, max_lon, max_lat]}.
-            Use the returned bbox immediately for `search_satellite_imagery` and
-            the center for `focus_location` — do NOT ask the user for
-            coordinates.
+              {name, center: [lat, lon],
+               bbox: [min_lon, min_lat, max_lon, max_lat],
+               geometry: <GeoJSON Polygon|MultiPolygon|null>}.
+
+            On success the backend immediately paints `geometry` (falling
+            back to bbox if null) onto the user's map via a SET_SEARCH_AREA
+            ui_action — so the user sees the boundary BEFORE provider
+            results arrive.
+
+            Pass `geometry` (when non-null) AND `bbox` into
+            `search_satellite_imagery` — the search will use the polygon as
+            an `intersects` filter for more precise results.
             """
             raise RuntimeError("tool body should not be invoked directly")
 
@@ -134,6 +143,9 @@ class LLMService:
             datetime_to=None,
             max_cloud_cover=None,
             limit=10,
+            image_type=None,
+            gsd=None,
+            geometry=None,
         ):
             """Search satellite imagery across ALL FOUR providers in parallel.
 
@@ -243,11 +255,16 @@ class LLMService:
         ai_msg: AIMessage = await self._llm_with_tools.ainvoke(messages)
         messages.append(ai_msg)
 
+        # Per-turn state shared across tool calls — keeps the geocoded
+        # polygon out of the LLM context (it's huge) while letting search
+        # auto-inject it server-side. Reset every turn.
+        turn_state: Dict[str, Any] = {"pending_geometry": None}
+
         rounds = 0
         while ai_msg.tool_calls and rounds < MAX_TOOL_ROUNDS:
             rounds += 1
             for call in ai_msg.tool_calls:
-                async for ev in self._dispatch_tool_call(call, messages):
+                async for ev in self._dispatch_tool_call(call, messages, turn_state):
                     yield ev
 
             ai_msg = await self._llm_with_tools.ainvoke(messages)
@@ -283,6 +300,7 @@ class LLMService:
         self,
         call: Dict[str, Any],
         messages: List[BaseMessage],
+        turn_state: Dict[str, Any],
     ) -> AsyncIterator[Dict[str, Any]]:
         name = call.get("name")
         args = call.get("args") or {}
@@ -291,7 +309,38 @@ class LLMService:
         yield _event("tool_call_trace", {"name": name, "arguments": args})
 
         if name == "geocode_location":
-            result_payload = await self._execute_geocode(args)
+            geocode_result = await self._execute_geocode(args)
+            # Per prompt 19: paint the resolved area on the user's map BEFORE
+            # the satellite search starts. The frontend's SET_SEARCH_AREA
+            # handler clears any user-drawn rectangle and flies the map to
+            # fit the polygon/bbox. If geocoding errored, geocode_result has
+            # `error` and we skip — no map mutation on failure.
+            if isinstance(geocode_result, dict) and "error" not in geocode_result:
+                yield _event("ui_action", {
+                    "command": UICommand.SET_SEARCH_AREA.value,
+                    "params": {
+                        "location_name": geocode_result.get("name"),
+                        "center": geocode_result.get("center"),
+                        "bbox": geocode_result.get("bbox"),
+                        "geometry": geocode_result.get("geometry"),
+                    },
+                })
+                # Stash the polygon for the upcoming search call.
+                # The LLM never sees it (the full geometry can be 1000s of
+                # tokens for an admin boundary like Hà Nội — that alone
+                # bursts Groq's 6000 TPM free-tier ceiling).
+                turn_state["pending_geometry"] = geocode_result.get("geometry")
+
+            # LLM-facing payload — strip the heavy geometry; just tell the
+            # model that one is available so it doesn't try to invent
+            # coords or skip the search.
+            result_payload = {
+                **{k: v for k, v in (geocode_result or {}).items() if k != "geometry"},
+                "has_polygon": bool(
+                    isinstance(geocode_result, dict)
+                    and geocode_result.get("geometry")
+                ),
+            }
 
         elif name == "search_satellite_imagery":
             # First, an immediate confirmation message into the chat so the
@@ -301,6 +350,14 @@ class LLMService:
                 "content": INITIAL_CONFIRMATION,
                 "stage": "confirmation",
             })
+
+            # Inject the geocoded polygon if the LLM didn't pass one. The
+            # LLM only saw `has_polygon: true` (not the actual geometry —
+            # too big for the context), so it can't forward the coords
+            # itself. The backend does it transparently.
+            if turn_state.get("pending_geometry") and not args.get("geometry"):
+                args = dict(args)
+                args["geometry"] = turn_state["pending_geometry"]
 
             # Fan out: each provider_update event streams as soon as its
             # provider finishes (in arrival order, not declaration order).
@@ -317,6 +374,15 @@ class LLMService:
                     "date_end": parsed.datetime_to,
                     "max_cloud": parsed.max_cloud_cover,
                     "limit": parsed.limit,
+                    # New in prompt 17: surface what the LLM detected so the
+                    # UI can pre-select the Image Type tab + GSD dropdown.
+                    "image_type": parsed.image_type or "optical",
+                    "gsd": parsed.gsd or "Very-high",
+                    # New in prompt 19: the LLM may pass an admin polygon
+                    # received from geocode_location. The frontend already
+                    # painted it via SET_SEARCH_AREA; including it here
+                    # keeps `search_params` round-trippable for Load More.
+                    "geometry": parsed.geometry.model_dump() if parsed.geometry else None,
                 })
 
                 async for ev, line in self._fan_out_providers(parsed):
@@ -432,6 +498,9 @@ class LLMService:
     ) -> None:
         """Run one provider's search; always pushes one item to the queue."""
         try:
+            geometry_dict = (
+                parsed.geometry.model_dump() if parsed.geometry else None
+            )
             if provider == Provider.SENTINEL:
                 scenes, matched = await self._stac.search_scenes(
                     bbox=bbox,
@@ -441,9 +510,13 @@ class LLMService:
                     limit=parsed.limit,
                     page=1,
                     sort_by=SortOrder.NEWEST,
+                    geometry=geometry_dict,
                 )
             elif provider in COMMERCIAL_PROVIDERS:
                 cloud_max = float(parsed.max_cloud_cover) if parsed.max_cloud_cover is not None else 100.0
+                effective_gsd = parsed.gsd or "Very-high"
+                if provider == Provider.AXELGLOBE:
+                    effective_gsd = None  # AxelGlobe doesn't accept GSD filtering
                 scenes, matched = await self._external.search(
                     provider=provider,
                     bbox=bbox,
@@ -452,6 +525,9 @@ class LLMService:
                     cloud_range=(0.0, cloud_max),
                     page=1,
                     limit=parsed.limit,
+                    image_type=parsed.image_type or "optical",
+                    gsd=effective_gsd,
+                    geometry=geometry_dict,
                 )
             else:
                 raise RuntimeError(f"unsupported provider {provider}")
@@ -470,6 +546,10 @@ class LLMService:
                     date_end=parsed.datetime_to,
                     max_cloud=parsed.max_cloud_cover,
                     sort_by=SortOrder.NEWEST,
+                    image_type=parsed.image_type or "optical",
+                    # Echo back NO gsd for AxelGlobe so the frontend's stored
+                    # state matches the disabled-dropdown UX.
+                    gsd=(parsed.gsd or "Very-high") if provider != Provider.AXELGLOBE else None,
                 ),
             )
             await queue.put({"provider": provider.value, "payload": payload})

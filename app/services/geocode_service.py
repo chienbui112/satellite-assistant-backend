@@ -66,6 +66,11 @@ class GeocodeService:
                 "format": "jsonv2",
                 "limit": 1,
                 "addressdetails": 0,
+                # New in prompt 19: ask Nominatim for the actual GeoJSON
+                # geometry of the place. The `geojson` field comes back as
+                # Polygon/MultiPolygon for administrative areas, Point for
+                # small/unmapped places (we fall back to bbox there).
+                "polygon_geojson": 1,
             },
         )
         if resp.status_code != 200:
@@ -94,10 +99,22 @@ def _normalise(raw: dict) -> dict:
     except (KeyError, ValueError, TypeError) as exc:
         raise GeocodeError(f"unexpected Nominatim payload: {raw!r}") from exc
 
+    # Polygon/MultiPolygon for administrative areas; Point for small places.
+    # We only keep Polygon-family geometries; a Point doesn't help as a
+    # search filter and the frontend falls back to the bbox rectangle.
+    geom = raw.get("geojson")
+    if isinstance(geom, dict):
+        gtype = geom.get("type")
+        if gtype not in ("Polygon", "MultiPolygon"):
+            geom = None
+    else:
+        geom = None
+
     return {
         "name": raw.get("display_name") or raw.get("name") or "",
         "center": [lat, lon],
         "bbox": [w, s, e, n],  # to [min_lon, min_lat, max_lon, max_lat]
+        "geometry": geom,
         "type": raw.get("type"),
         "osm_id": raw.get("osm_id"),
     }

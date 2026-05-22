@@ -159,6 +159,13 @@ class SearchParams(BaseModel):
     date_end: Optional[str] = None
     max_cloud: Optional[float] = None
     sort_by: SortOrder = SortOrder.NEWEST
+    # New in prompt 17: explicit filter-panel fields.
+    # image_type: "optical" | "thermal" | "sar". Drives the external
+    # aggregator's `image_type` body field; Sentinel ignores it.
+    image_type: Optional[str] = "optical"
+    # gsd: "Very-high" | "High" | "Medium" | "Low". Maps to the external
+    # aggregator's `gsd` body field; ignored for Sentinel and AxelGlobe.
+    gsd: Optional[str] = "Very-high"
 
 
 class SearchResultsPayload(BaseModel):
@@ -219,6 +226,29 @@ class SceneSearchArgs(BaseModel):
     # pages via /api/search-satellite. Default 10 matches the right-rail's
     # tab page size across all providers.
     limit: int = Field(10, ge=1, le=50)
+    # Optional — the LLM may extract these from user intent ("SAR over X",
+    # "Tìm ảnh nhiệt..."). The UI's filter panel uses them to pre-select
+    # the right tab/dropdown.
+    image_type: Optional[str] = Field(
+        None,
+        description="optical | thermal | sar (default 'optical')",
+    )
+    gsd: Optional[str] = Field(
+        None,
+        description="Ground Sample Distance bucket: Very-high | High | Medium | Low",
+    )
+    # New in prompt 19: when geocode_location returns a polygon, the LLM
+    # should pass the GeoJSON geometry here. STAC then searches with
+    # `intersects` (more precise than the bbox envelope), and the external
+    # aggregator gets the actual administrative polygon in its `aois` field.
+    # bbox still required as a fallback for the polygon's envelope.
+    geometry: Optional[GeoJSONGeometry] = Field(
+        None,
+        description=(
+            "Optional GeoJSON Polygon/MultiPolygon returned by geocode_location. "
+            "When present, used as the spatial filter; bbox becomes a fallback."
+        ),
+    )
 
     @field_validator("bbox")
     @classmethod
@@ -237,13 +267,18 @@ class UICommand(str, Enum):
     CLEAR_ROI = "CLEAR_ROI"
     CLEAR_RESULTS = "CLEAR_RESULTS"
     FOCUS_LOCATION = "FOCUS_LOCATION"
+    # New in prompt 19: emitted right after `geocode_location` so the
+    # resolved polygon paints onto the map BEFORE provider results arrive.
+    # Both the polygon (preferred) and the bbox (fallback) ride along so
+    # the frontend can render whichever it has.
+    SET_SEARCH_AREA = "SET_SEARCH_AREA"
 
 
 class UIActionParams(BaseModel):
     """Params for a UI action. Most fields are command-specific; we keep
     them all in one model so the response schema stays flat for the
     frontend to consume."""
-    # FOCUS_LOCATION
+    # FOCUS_LOCATION + SET_SEARCH_AREA
     center: Optional[List[float]] = Field(
         None,
         description="[lat, lon] in EPSG:4326 (Leaflet's order, NOT bbox order)",
@@ -252,6 +287,18 @@ class UIActionParams(BaseModel):
     )
     location_name: Optional[str] = None
     zoom: Optional[int] = Field(None, ge=1, le=20)
+    # SET_SEARCH_AREA — both bbox (always) and geometry (when Nominatim
+    # returned a polygon for this place).
+    bbox: Optional[List[float]] = Field(
+        None,
+        description="[min_lon, min_lat, max_lon, max_lat] EPSG:4326",
+        min_length=4,
+        max_length=4,
+    )
+    geometry: Optional[GeoJSONGeometry] = Field(
+        None,
+        description="Polygon | MultiPolygon for the resolved administrative area",
+    )
     # Shared
     reason: Optional[str] = None
 

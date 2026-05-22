@@ -92,6 +92,9 @@ class ExternalProviderService:
         cloud_range: Tuple[float, float],
         page: int,
         limit: int,
+        image_type: str = "optical",
+        gsd: Optional[str] = "Very-high",
+        geometry: Optional[dict] = None,
     ) -> Tuple[List[Scene], int]:
         """Returns (scenes, total_matched). Empty result if no URL configured."""
         if provider not in COMMERCIAL_PROVIDERS:
@@ -116,6 +119,9 @@ class ExternalProviderService:
             page=page,
             limit=limit,
             fallback_page_size=self._settings.external_provider_page_size,
+            image_type=image_type,
+            gsd=gsd,
+            geometry=geometry,
         )
         # Per spec: provider_code is supplied as BOTH a query param and a
         # body field. Some aggregators inspect one or the other depending on
@@ -179,22 +185,53 @@ def _build_external_payload(
     page: int,
     limit: int,
     fallback_page_size: int,
+    image_type: str = "optical",
+    gsd: Optional[str] = "Very-high",
+    geometry: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build the JSON body the geohub aggregator expects."""
-    return {
-        "gsd": "Very-high",
+    """Build the JSON body the geohub aggregator expects.
+
+    When a `geometry` (Polygon/MultiPolygon) is supplied, its coordinates
+    go straight into `aois` — the aggregator handles non-rectangular shapes
+    natively. Otherwise we synthesise a rectangle from the bbox.
+    """
+    if geometry and isinstance(geometry, dict) and geometry.get("coordinates"):
+        # MultiPolygon → expand to multiple aoi entries so each polygon is
+        # treated independently by the aggregator. For Polygon, a single
+        # entry with the same shape.
+        gtype = geometry.get("type", "Polygon")
+        if gtype == "MultiPolygon":
+            aois = [
+                {"type": "Polygon", "coordinates": poly}
+                for poly in geometry["coordinates"]
+            ]
+        else:
+            aois = [{
+                "type": "Polygon",
+                "coordinates": geometry["coordinates"],
+            }]
+    else:
+        aois = [{
+            "type": "Polygon",
+            "coordinates": _bbox_to_polygon_ring(bbox),
+        }]
+
+    body: Dict[str, Any] = {
         "date_from": _to_epoch_ms(date_start, end_of_day=False),
         "date_to":   _to_epoch_ms(date_end,   end_of_day=True),
         "cloud_cover": [float(cloud_range[0]), float(cloud_range[1])],
-        "aois": [{
-            "type": "Polygon",
-            "coordinates": _bbox_to_polygon_ring(bbox),
-        }],
+        "aois": aois,
         "page_number": page,
         "page_size": limit or fallback_page_size,
         "provider_code": provider.value,
-        "image_type": "optical",  # all three commercial vendors are optical
+        "image_type": image_type or "optical",
     }
+    # AxelGlobe explicitly does NOT support GSD filtering (per the
+    # frontend's warning banner). For other providers, send whatever the
+    # caller chose, defaulting to Very-high.
+    if gsd:
+        body["gsd"] = gsd
+    return body
 
 
 # ---------------- response normalisation ----------------
