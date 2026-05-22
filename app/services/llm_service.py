@@ -275,6 +275,16 @@ class LLMService:
                 "Reached MAX_TOOL_ROUNDS=%d without a final reply", MAX_TOOL_ROUNDS
             )
 
+        # Flush any deferred SET_SEARCH_AREA that wasn't consumed by a search.
+        # geocode_location buffers its ui_action in turn_state instead of
+        # yielding immediately, so multi-place turns ("So sánh Hà Nội với
+        # TP.HCM") coalesce into ONE map update, even when the LLM spreads
+        # the geocode calls across separate tool-rounds.
+        pending = turn_state.get("pending_search_area")
+        if pending is not None:
+            yield _event("ui_action", pending)
+            turn_state["pending_search_area"] = None
+
         # Final assistant reply — consolidated summary if a search ran.
         final_text = _text_of(ai_msg)
         if final_text:
@@ -315,8 +325,17 @@ class LLMService:
             # handler clears any user-drawn rectangle and flies the map to
             # fit the polygon/bbox. If geocoding errored, geocode_result has
             # `error` and we skip — no map mutation on failure.
+            #
+            # Dedupe across the whole turn: instead of yielding immediately,
+            # stash the ui_action in turn_state. It gets flushed either right
+            # before the next search runs (so the user sees the polygon
+            # before results stream in) or at the very end of the turn (if
+            # no search follows). This collapses multi-place turns
+            # ("So sánh Hà Nội với TP.HCM") into ONE map update — last
+            # geocode wins — even when the LLM spreads the geocode calls
+            # across separate tool-rounds.
             if isinstance(geocode_result, dict) and "error" not in geocode_result:
-                yield _event("ui_action", {
+                turn_state["pending_search_area"] = {
                     "command": UICommand.SET_SEARCH_AREA.value,
                     "params": {
                         "location_name": geocode_result.get("name"),
@@ -324,7 +343,7 @@ class LLMService:
                         "bbox": geocode_result.get("bbox"),
                         "geometry": geocode_result.get("geometry"),
                     },
-                })
+                }
                 # Stash the polygon for the upcoming search call.
                 # The LLM never sees it (the full geometry can be 1000s of
                 # tokens for an admin boundary like Hà Nội — that alone
@@ -343,8 +362,19 @@ class LLMService:
             }
 
         elif name == "search_satellite_imagery":
-            # First, an immediate confirmation message into the chat so the
-            # user sees instant feedback while the four providers spin up.
+            # Flush any deferred SET_SEARCH_AREA from prior geocode calls in
+            # this turn before results start streaming. The user sees the
+            # polygon appear → then the "Searching..." confirmation → then
+            # provider_update rows. If the LLM emitted multiple geocodes
+            # earlier (same round or across rounds), only the LAST one's
+            # area is flushed here — no flicker A → B.
+            pending = turn_state.get("pending_search_area")
+            if pending is not None:
+                yield _event("ui_action", pending)
+                turn_state["pending_search_area"] = None
+
+            # An immediate confirmation message into the chat so the user
+            # sees instant feedback while the four providers spin up.
             yield _event("chat_message", {
                 "role": "assistant",
                 "content": INITIAL_CONFIRMATION,
