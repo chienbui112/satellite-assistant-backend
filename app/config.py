@@ -84,6 +84,22 @@ class Settings(BaseSettings):
     )
     log_level: str = "INFO"
 
+    # --- Geometry simplification ---
+    # Douglas-Peucker tolerance (degrees) for shrinking admin-boundary
+    # polygons before they ride in URL query strings, SSE payloads, or
+    # provider request bodies. Reference: 0.001°≈110m, 0.005°≈555m.
+    # 0.005 chosen as default because:
+    #   - Hà Nội from Nominatim has ~5400 vertices, ~146 KB JSON raw.
+    #     At 0.005: ~160 vertices, ~4 KB JSON, ~12 KB URL-encoded.
+    #     At 0.001: ~650 vertices, ~17 KB JSON, ~50 KB URL-encoded —
+    #     blows past nginx's default 8 KB request line.
+    #   - Footprint filtering for satellite scenes (Sentinel-2 10 m,
+    #     AxelGlobe 2.5 m, Maxar 0.3 m) does NOT need 110 m precision —
+    #     scenes are 100 km+ wide, polygon edge offset of 555 m never
+    #     changes which scenes intersect.
+    # Set to 0 to disable simplification entirely.
+    geometry_simplify_tolerance: float = 0.005
+
     # --- Conversation history window ---
     # How many *past* user-anchored turns of history to send to the LLM each
     # turn. A "turn" is one user message + the assistant reply (+ any tool

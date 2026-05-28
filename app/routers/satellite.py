@@ -22,8 +22,10 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.config import Settings
 from app.dependencies import (
     get_external_provider_service,
+    get_settings,
     get_stac_service,
 )
 from app.models.schemas import (
@@ -40,6 +42,7 @@ from app.services.external_provider_service import (
     ExternalProviderError,
     ExternalProviderService,
 )
+from app.services.geometry_utils import simplify_geojson_geometry
 from app.services.stac_service import STACSearchError, STACService
 
 router = APIRouter(prefix="/api", tags=["satellite"])
@@ -59,15 +62,23 @@ def _parse_geometry(geometry: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     try:
         decoded = json.loads(geometry)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        # Include a truncated snippet of the offending value so the frontend
+        # team can see whether they sent `[object Object]`, an unquoted JS
+        # object literal, etc. Common bug: passing the geometry through
+        # URLSearchParams without JSON.stringify first.
+        snippet = geometry[:120] + ("…" if len(geometry) > 120 else "")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="geometry must be a URL-encoded JSON Polygon/MultiPolygon",
+            detail=(
+                "geometry must be a URL-encoded JSON Polygon/MultiPolygon "
+                f"(got {snippet!r}; JSON parse error: {e})"
+            ),
         )
     if not isinstance(decoded, dict):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="geometry must be a GeoJSON object",
+            detail=f"geometry must be a GeoJSON object (got {type(decoded).__name__})",
         )
     gtype = decoded.get("type")
     if gtype not in ("Polygon", "MultiPolygon"):
@@ -139,9 +150,17 @@ async def search_satellite(
     limit: int = Query(10, ge=1, le=50),
     stac: STACService = Depends(get_stac_service),
     external: ExternalProviderService = Depends(get_external_provider_service),
+    settings: Settings = Depends(get_settings),
 ) -> SearchResultsPayload:
     bbox_tuple = _parse_bbox(bbox)
     geometry_obj = _parse_geometry(geometry)
+    # Defensive simplify — geocode already simplifies at source, but the
+    # frontend might pass in a user-drawn polygon (rare) or a polygon from
+    # an unrelated source. Cheap no-op when already small.
+    if geometry_obj is not None:
+        geometry_obj = simplify_geojson_geometry(
+            geometry_obj, settings.geometry_simplify_tolerance,
+        )
 
     if provider == Provider.SENTINEL:
         try:

@@ -57,6 +57,7 @@ async def chat(
                 mode=payload.mode,
                 history=payload.history,
                 bbox=payload.bbox,
+                geometry=payload.geometry,
             ):
                 # Bail early if the client closed the connection — both for
                 # politeness (don't keep four upstream STAC calls running)

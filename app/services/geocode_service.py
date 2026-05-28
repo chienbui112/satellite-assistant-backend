@@ -23,6 +23,7 @@ from typing import Optional
 import httpx
 
 from app.config import Settings
+from app.services.geometry_utils import simplify_geojson_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,15 @@ class GeocodeService:
             raise GeocodeError(f"no match for: {location_name!r}")
 
         result = _normalise(results[0])
+        # Simplify ONCE at the source so the trimmed polygon propagates to
+        # every downstream consumer: SET_SEARCH_AREA payload, frontend
+        # storage, paginated /api/search-satellite re-queries, and the
+        # provider request bodies. Cached as-simplified.
+        if result.get("geometry"):
+            result["geometry"] = simplify_geojson_geometry(
+                result["geometry"],
+                self._settings.geometry_simplify_tolerance,
+            )
         _cache_put(name.lower(), result)
         return result
 

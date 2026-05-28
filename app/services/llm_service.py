@@ -43,9 +43,11 @@ from app.models.schemas import (
     COMMERCIAL_PROVIDERS,
     FocusLocationArgs,
     GeocodeArgs,
+    GeoJSONGeometry,
     Provider,
     Scene,
     SceneSearchArgs,
+    SceneSearchArgsLLM,
     SearchPagination,
     SearchParams,
     SearchResultsPayload,
@@ -115,28 +117,28 @@ class LLMService:
     def _build_tools(self):
         @tool("geocode_location", args_schema=GeocodeArgs)
         def geocode_location(location_name):
-            """Resolve a place name into a bbox + center + administrative
-            polygon (when available).
+            """Resolve a place name into a bbox + center point.
 
             Call this FIRST when the user mentions a city/region/country by
             name (e.g. "Hanoi", "Hà Nội", "Tokyo", "Da Nang") and you do not
             already have a bbox for it from the map context. Returns:
               {name, center: [lat, lon],
                bbox: [min_lon, min_lat, max_lon, max_lat],
-               geometry: <GeoJSON Polygon|MultiPolygon|null>}.
+               has_polygon: true | false}.
 
-            On success the backend immediately paints `geometry` (falling
-            back to bbox if null) onto the user's map via a SET_SEARCH_AREA
-            ui_action — so the user sees the boundary BEFORE provider
-            results arrive.
+            On success the backend automatically:
+              - paints the administrative polygon (when has_polygon is true,
+                otherwise the bbox rectangle) on the user's map via a
+                SET_SEARCH_AREA ui_action,
+              - remembers the polygon server-side for the upcoming search.
 
-            Pass `geometry` (when non-null) AND `bbox` into
-            `search_satellite_imagery` — the search will use the polygon as
-            an `intersects` filter for more precise results.
+            Just pass the returned `bbox` to `search_satellite_imagery`. Do
+            NOT try to construct or pass a polygon — you don't have the
+            coordinates and inventing them will break the tool call.
             """
             raise RuntimeError("tool body should not be invoked directly")
 
-        @tool("search_satellite_imagery", args_schema=SceneSearchArgs)
+        @tool("search_satellite_imagery", args_schema=SceneSearchArgsLLM)
         def search_satellite_imagery(
             bbox,
             datetime_from=None,
@@ -145,7 +147,6 @@ class LLMService:
             limit=10,
             image_type=None,
             gsd=None,
-            geometry=None,
         ):
             """Search satellite imagery across ALL FOUR providers in parallel.
 
@@ -160,6 +161,10 @@ class LLMService:
             [min_lon, min_lat, max_lon, max_lat]. Dates are ISO-8601
             (YYYY-MM-DD). max_cloud_cover is a percent (0-100). limit is the
             per-provider page size (default 10).
+
+            NOTE: If geocode_location was called earlier this turn (or the
+            user drew a polygon), the backend AUTOMATICALLY uses the precise
+            polygon as the spatial filter — you only pass the bbox.
             """
             raise RuntimeError("tool body should not be invoked directly")
 
@@ -211,6 +216,7 @@ class LLMService:
         mode: UserMode,
         history: List[ChatMessage],
         bbox: BBox | None,
+        geometry: GeoJSONGeometry | None = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Run one chat turn and yield typed events as work completes.
 
@@ -230,17 +236,39 @@ class LLMService:
         """
         yield _event("chat_start", {})
 
+        # Derive an envelope bbox from the polygon if the caller only gave us
+        # a geometry — the LLM tool requires a bbox arg, and MAP CONTEXT text
+        # is bbox-shaped. The polygon itself is the source of truth for the
+        # actual spatial filter and is auto-injected at search dispatch time.
+        effective_bbox = bbox
+        if geometry is not None and effective_bbox is None:
+            effective_bbox = _envelope_of_geometry(geometry)
+
         messages: List[BaseMessage] = [SystemMessage(content=get_system_prompt(mode))]
-        if bbox is not None:
-            messages.append(
-                SystemMessage(
-                    content=(
-                        "MAP CONTEXT: the user has drawn a bounding box on the map. "
-                        f"Use this ROI for any spatial search: bbox={list(bbox)} "
-                        "(EPSG:4326, [min_lon, min_lat, max_lon, max_lat])."
+        if effective_bbox is not None:
+            if geometry is not None:
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "MAP CONTEXT: the user has drawn a polygon AOI on the map. "
+                            f"Its bounding envelope is bbox={list(effective_bbox)} "
+                            "(EPSG:4326). Pass this bbox to search_satellite_imagery — "
+                            "the backend already has the full polygon and will use it "
+                            "as the precise spatial filter (more accurate than the envelope). "
+                            "Do NOT call geocode_location for any place name; the AOI is set."
+                        )
                     )
                 )
-            )
+            else:
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "MAP CONTEXT: the user has drawn a bounding box on the map. "
+                            f"Use this ROI for any spatial search: bbox={list(effective_bbox)} "
+                            "(EPSG:4326, [min_lon, min_lat, max_lon, max_lat])."
+                        )
+                    )
+                )
 
         window = self._settings.chat_history_window_size
         trimmed = _trim_history(history, window)
@@ -258,7 +286,15 @@ class LLMService:
         # Per-turn state shared across tool calls — keeps the geocoded
         # polygon out of the LLM context (it's huge) while letting search
         # auto-inject it server-side. Reset every turn.
-        turn_state: Dict[str, Any] = {"pending_geometry": None}
+        #
+        # Seed `pending_geometry` with the user-drawn polygon (if any) so
+        # search_satellite_imagery auto-injects it without the LLM having
+        # to know the coordinates. A subsequent geocode_location in the
+        # same turn would override this — that matches user intent (naming
+        # a place AFTER drawing means "search there instead").
+        turn_state: Dict[str, Any] = {
+            "pending_geometry": geometry.model_dump() if geometry is not None else None,
+        }
 
         rounds = 0
         while ai_msg.tool_calls and rounds < MAX_TOOL_ROUNDS:
@@ -297,7 +333,7 @@ class LLMService:
         token_metrics = self._compute_token_metrics(messages)
         yield _event("token_metrics", token_metrics.model_dump())
 
-        updated_history = _lc_to_history(messages[1 + (1 if bbox else 0):])
+        updated_history = _lc_to_history(messages[1 + (1 if effective_bbox else 0):])
         yield _event(
             "updated_history",
             [m.model_dump() for m in updated_history],
@@ -381,12 +417,14 @@ class LLMService:
                 "stage": "confirmation",
             })
 
-            # Inject the geocoded polygon if the LLM didn't pass one. The
-            # LLM only saw `has_polygon: true` (not the actual geometry —
-            # too big for the context), so it can't forward the coords
-            # itself. The backend does it transparently.
-            if turn_state.get("pending_geometry") and not args.get("geometry"):
-                args = dict(args)
+            # ALWAYS discard any `geometry` the LLM emitted — it never sees
+            # the actual polygon (stripped from geocode_location's result),
+            # so any value it sends is either omitted (good) or hallucinated
+            # (bad: smaller models like Llama 3.3 70B fabricate degenerate
+            # polygons that break Groq's tool-call parser). Then re-inject
+            # the real polygon from turn_state when we have one.
+            args = {k: v for k, v in args.items() if k != "geometry"}
+            if turn_state.get("pending_geometry"):
                 args["geometry"] = turn_state["pending_geometry"]
 
             # Fan out: each provider_update event streams as soon as its
@@ -572,6 +610,11 @@ class LLMService:
                 ),
                 search_params=SearchParams(
                     bbox=list(bbox),
+                    # Echo the polygon actually used (user-drawn or geocoded)
+                    # so the frontend's Load More re-issues the SAME spatial
+                    # filter — not the bbox envelope, which would widen the
+                    # search and return extra scenes on later pages.
+                    geometry=parsed.geometry,
                     date_start=parsed.datetime_from,
                     date_end=parsed.datetime_to,
                     max_cloud=parsed.max_cloud_cover,
@@ -761,6 +804,25 @@ def _format_scene_summary(
         "page_number": f"{page} of {total_pages}",
         "summary": header + body,
     }
+
+
+def _envelope_of_geometry(geom: GeoJSONGeometry) -> Tuple[float, float, float, float]:
+    """Return [min_lon, min_lat, max_lon, max_lat] for a Polygon/MultiPolygon.
+
+    Used only for the LLM-facing MAP CONTEXT text — we never want the LLM
+    seeing raw polygon coords (admin boundaries can be 1000s of vertices,
+    bursting the TPM ceiling). The backend keeps the actual polygon and
+    routes it to the search call server-side.
+    """
+    coords: Any = geom.coordinates
+    # Walk down nested lists until we reach a [lon, lat] pair.
+    while coords and isinstance(coords[0], list) and (
+        not coords[0] or isinstance(coords[0][0], list)
+    ):
+        coords = coords[0]
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    return (min(lons), min(lats), max(lons), max(lats))
 
 
 def _trim_history(

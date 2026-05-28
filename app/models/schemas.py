@@ -71,8 +71,17 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     mode: UserMode = UserMode.BEGINNER
     history: List[ChatMessage] = Field(default_factory=list)
-    # ROI drawn on the map; if present, it is injected into the model context
+    # ROI drawn on the map. The frontend may send either or both:
+    #   - bbox:     a rectangle drawn by the user, or the envelope of a
+    #               free-form polygon (always populated when geometry is).
+    #   - geometry: a free-form Polygon/MultiPolygon (when the user drew
+    #               something non-rectangular). Preferred over bbox for the
+    #               actual spatial filter — the bbox is only used as a
+    #               fallback for the LLM-facing MAP CONTEXT text (the LLM
+    #               never sees the geometry coords; would burst the TPM
+    #               ceiling for admin-boundary polygons).
     bbox: Optional[BBox] = None
+    geometry: Optional[GeoJSONGeometry] = None
 
     @field_validator("bbox")
     @classmethod
@@ -86,6 +95,19 @@ class ChatRequest(BaseModel):
             raise ValueError("latitude out of range")
         if min_lon >= max_lon or min_lat >= max_lat:
             raise ValueError("bbox must be [min_lon, min_lat, max_lon, max_lat] with min < max")
+        return v
+
+    @field_validator("geometry")
+    @classmethod
+    def validate_geometry(cls, v: Optional[GeoJSONGeometry]) -> Optional[GeoJSONGeometry]:
+        if v is None:
+            return v
+        if v.type not in ("Polygon", "MultiPolygon"):
+            raise ValueError(
+                f"geometry.type must be Polygon or MultiPolygon, got {v.type!r}"
+            )
+        if not isinstance(v.coordinates, list) or not v.coordinates:
+            raise ValueError("geometry.coordinates must be a non-empty list")
         return v
 
 
@@ -155,6 +177,11 @@ class SearchParams(BaseModel):
     this after the first turn so it can re-issue paginated requests against
     /api/search-satellite without round-tripping through the LLM."""
     bbox: List[float] = Field(..., min_length=4, max_length=4)
+    # Optional Polygon/MultiPolygon used as the actual spatial filter when
+    # the user drew a free-form shape or geocode_location returned an admin
+    # boundary. Frontend re-sends this on Load More so subsequent pages
+    # match exactly the first page's filter.
+    geometry: Optional[GeoJSONGeometry] = None
     date_start: Optional[str] = None
     date_end: Optional[str] = None
     max_cloud: Optional[float] = None
@@ -248,6 +275,56 @@ class SceneSearchArgs(BaseModel):
             "Optional GeoJSON Polygon/MultiPolygon returned by geocode_location. "
             "When present, used as the spatial filter; bbox becomes a fallback."
         ),
+    )
+
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox(cls, v: List[float]) -> List[float]:
+        if len(v) != 4:
+            raise ValueError("bbox must have exactly 4 elements")
+        min_lon, min_lat, max_lon, max_lat = v
+        if min_lon >= max_lon or min_lat >= max_lat:
+            raise ValueError("bbox must have min < max for both axes")
+        return v
+
+
+class SceneSearchArgsLLM(BaseModel):
+    """LLM-facing args_schema for `search_satellite_imagery`.
+
+    Deliberately a SUBSET of SceneSearchArgs — `geometry` is NOT exposed
+    because the LLM never sees the actual polygon (it's stashed in
+    turn_state and auto-injected at dispatch time). Exposing it caused
+    Llama 3.3 70B to hallucinate fake coordinates (centre-point repeated
+    4 times in a malformed 4-level-nested array), producing JSON that
+    Groq's tool-call parser rejected with `tool_use_failed`.
+
+    Keep this schema flat and string-typed wherever possible — Llama-class
+    models on Groq use a custom `<function=...>{json}</function>` wrapper
+    that breaks on nested objects.
+    """
+    bbox: List[float] = Field(
+        ...,
+        description="[min_lon, min_lat, max_lon, max_lat] in EPSG:4326",
+        min_length=4,
+        max_length=4,
+    )
+    datetime_from: Optional[str] = Field(
+        None, description="ISO-8601 start, e.g. 2026-05-01"
+    )
+    datetime_to: Optional[str] = Field(
+        None, description="ISO-8601 end, e.g. 2026-05-31"
+    )
+    max_cloud_cover: Optional[float] = Field(
+        None, ge=0, le=100, description="Max cloud cover percent"
+    )
+    limit: int = Field(10, ge=1, le=50)
+    image_type: Optional[str] = Field(
+        None,
+        description="optical | thermal | sar (default 'optical')",
+    )
+    gsd: Optional[str] = Field(
+        None,
+        description="Ground Sample Distance bucket: Very-high | High | Medium | Low",
     )
 
     @field_validator("bbox")
